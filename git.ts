@@ -41,6 +41,49 @@ const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+/**
+ * Small FIFO cache for responses that are pure functions of immutable git
+ * objects plus the request: identical clones of one tip share one pack, so
+ * 50 concurrent depth-1 clones pay the pack build (deflate + SHA-1) once.
+ * A cache key names the repo, the wants/haves/shallow set and the depth;
+ * objects are content-addressed and immutable, so a cached pack for a
+ * given want can never go stale — a push only creates new keys. Bounded
+ * so a long trial cannot grow it without limit.
+ */
+const RESPONSE_CACHE = new Map<string, Buffer>();
+const CACHE_MAX = 64;
+
+function cacheGet(key: string): Buffer | undefined {
+  return RESPONSE_CACHE.get(key);
+}
+
+function cachePut(key: string, value: Buffer): void {
+  if (RESPONSE_CACHE.has(key)) return;
+  if (RESPONSE_CACHE.size >= CACHE_MAX) {
+    const oldest = RESPONSE_CACHE.keys().next().value;
+    if (oldest !== undefined) RESPONSE_CACHE.delete(oldest);
+  }
+  RESPONSE_CACHE.set(key, value);
+}
+
+/** The ref list as a cache-key component (self-validating: any ref move changes it). */
+function refSignature(repo: Repo): string {
+  return [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, oid]) => `${name}=${oid}`)
+    .join(';');
+}
+
+/** The v2 advertisement never varies: one shared buffer. */
+const V2_ADVERTISEMENT = encodePktLines([
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 function err(status: number, message: string): RestResult {
   return { status, body: { message } };
 }
@@ -133,14 +176,7 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
 
 /** A v2 capability advertisement: `version 2`, capability lines, flush. */
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -187,6 +223,9 @@ function parseLsRefsArgs(lines: string[]): LsRefsArgs {
 
 function handleLsRefs(repo: Repo, lines: string[]): Buffer {
   const args = parseLsRefsArgs(lines);
+  const cacheKey = `ls-refs|${repo.id}|${refSignature(repo)}|${args.peel}|${args.symrefs}|${args.unborn}|${args.prefixes.join(',')}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
   const out: Buffer[] = [];
   const keep = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
@@ -210,7 +249,9 @@ function handleLsRefs(repo: Repo, lines: string[]): Buffer {
     out.push(pktLine(`${line}\n`));
   }
   out.push(pktFlush());
-  return Buffer.concat(out);
+  const built = Buffer.concat(out);
+  cachePut(cacheKey, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -421,6 +462,9 @@ function parseFetchArgs(lines: string[]): FetchRequest {
 
 function handleFetchV2(repo: Repo, lines: string[]): Buffer {
   const req = parseFetchArgs(lines);
+  const cacheKey = `fetch-v2|${repo.id}|${req.wants.join(',')}|${req.haves.join(',')}|${req.shallowIn.join(',')}|${req.depth}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, req);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -452,7 +496,9 @@ function handleFetchV2(repo: Repo, lines: string[]): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandWrap(pack, 1));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  cachePut(cacheKey, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -480,7 +526,11 @@ function parseFetchV0(first: string[], second: string[]): FetchRequest {
 }
 
 function handleFetchV0(repo: Repo, first: string[], second: string[]): Buffer {
-  const plan = planFetch(repo, parseFetchV0(first, second));
+  const req = parseFetchV0(first, second);
+  const cacheKey = `fetch-v0|${repo.id}|${req.wants.join(',')}|${req.haves.join(',')}|${req.shallowIn.join(',')}|${req.depth}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+  const plan = planFetch(repo, req);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   if (plan.acks.length > 0) {
@@ -499,7 +549,9 @@ function handleFetchV0(repo: Repo, first: string[], second: string[]): Buffer {
   // the stream. The suite's client ignores flush packets either way.
   parts.push(sidebandWrap(pack, 1));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  cachePut(cacheKey, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
