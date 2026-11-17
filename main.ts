@@ -1,3 +1,6 @@
+// Forge entrypoint: boots the clone server for github-core-clone-01.
+// It claims a free port, reports it to the trial environment, then idles until that environment signals completion.
+// The HTTP behaviour itself is defined in app.ts, not here.
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
