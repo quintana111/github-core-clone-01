@@ -45,12 +45,15 @@ let requestSeq = 0;
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   const requestId = `req-${String(requestSeq).padStart(8, '0')}`;
-  res.writeHead(status, {
+  const outHeaders: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId,
-    ...(text === '' ? {} : { 'content-length': Buffer.byteLength(text) }),
-    ...headers,
-  });
+  };
+  if (text !== '') outHeaders['content-length'] = String(Buffer.byteLength(text));
+  for (const key of Object.keys(headers)) {
+    outHeaders[key] = headers[key] as string;
+  }
+  res.writeHead(status, outHeaders);
   res.end(text);
 }
 
@@ -59,53 +62,78 @@ function sendResult(res: ServerResponse, result: RestResult): void {
 }
 
 function pathSegments(req: IncomingMessage): string[] {
-  let pathname = '/';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    pathname = '/';
-  }
-  return pathname
-    .split('/')
-    .filter((s) => s !== '')
-    .map((s) => {
+  const url = req.url ?? '/';
+  const q = url.indexOf('?');
+  const path = q === -1 ? url : url.slice(0, q);
+  const out: string[] = [];
+  for (const s of path.split('/')) {
+    if (s === '') continue;
+    if (s.includes('%')) {
       try {
-        return decodeURIComponent(s);
+        out.push(decodeURIComponent(s));
+        continue;
       } catch {
-        return s;
+        // Fall through to the raw segment, as before.
       }
-    });
+    }
+    out.push(s);
+  }
+  return out;
 }
 
 function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  const url = req.url ?? '/';
+  const q = url.indexOf('?');
+  if (q === -1) return new URLSearchParams();
+  return new URLSearchParams(url.slice(q + 1));
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer | { error: 'too-large' }> {
   return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
+    let firstChunk: Buffer | undefined;
+    let chunks: Buffer[] | undefined;
     let total = 0;
     let done = false;
+
     const finish = (value: Buffer | { error: 'too-large' }): void => {
       if (done) return;
       done = true;
       resolve(value);
     };
+
+    const bodySoFar = (): Buffer => {
+      if (firstChunk === undefined) return Buffer.alloc(0);
+      if (chunks === undefined) return firstChunk;
+      return Buffer.concat(chunks, total);
+    };
+
     req.on('data', (chunk: Buffer) => {
+      if (done) return;
+
       total += chunk.length;
+
       if (total > MAX_BODY_BYTES) {
         finish({ error: 'too-large' });
         req.destroy();
         return;
       }
-      chunks.push(chunk);
+
+      if (firstChunk === undefined) {
+        firstChunk = chunk;
+      } else if (chunks === undefined) {
+        chunks = [firstChunk, chunk];
+      } else {
+        chunks.push(chunk);
+      }
     });
-    req.on('end', () => finish(Buffer.concat(chunks)));
-    req.on('error', () => finish(Buffer.concat(chunks)));
+
+    req.on('end', () => {
+      if (!done) finish(bodySoFar());
+    });
+
+    req.on('error', () => {
+      if (!done) finish(bodySoFar());
+    });
   });
 }
 

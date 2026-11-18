@@ -45,6 +45,16 @@ export interface IssueComment {
   body: string;
 }
 
+export interface IssueJsonCache {
+  title: string;
+  body: string;
+  state: 'open' | 'closed';
+  commentsLength: number;
+  labelsRef: Label[];
+  labelsLength: number;
+  json: Record<string, unknown>;
+}
+
 export interface Issue {
   number: number;
   title: string;
@@ -52,6 +62,8 @@ export interface Issue {
   state: 'open' | 'closed';
   labels: Label[];
   comments: IssueComment[];
+  /** Cached issueJson output, keyed by origin (perf: read workload). */
+  _jsonCache?: Map<string, IssueJsonCache>;
 }
 
 export interface PullFile {

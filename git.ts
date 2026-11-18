@@ -18,6 +18,7 @@ import type { Repo } from './store.ts';
 import {
   isAncestor,
   parseCommit,
+  parseCommitParents,
   parseTag,
   parseTree,
   type GitObject,
@@ -276,7 +277,7 @@ interface FetchRequest {
 function commitParents(repo: Repo, oid: string): string[] {
   const obj = repo.objects.get(oid);
   if (obj === undefined || obj.type !== 'commit') return [];
-  return parseCommit(obj.data)?.parents ?? [];
+  return parseCommitParents(obj.data) ?? [];
 }
 
 /**
@@ -308,7 +309,12 @@ function planFetch(repo: Repo, req: FetchRequest): FetchPlan {
 
   // Commits to deliver: breadth-first from the wants, depth-limited.
   const included = new Set<string>();
-  {
+  if (req.depth === 1) {
+    // Depth 1 delivers exactly the wants themselves: no parent expansion.
+    for (const oid of wantCommits) {
+      if (lookup(oid)?.type === 'commit') included.add(oid);
+    }
+  } else {
     const queue: { oid: string; dist: number }[] = wantCommits.map((oid) => ({ oid, dist: 1 }));
     let head = 0;
     while (head < queue.length) {
@@ -325,8 +331,9 @@ function planFetch(repo: Repo, req: FetchRequest): FetchPlan {
   }
 
   // Commits the client holds: closure of the haves, cut at its boundaries.
+  // Empty when the client sent no haves (fresh clone/fetch): skip the work.
   const held = new Set<string>();
-  {
+  if (req.haves.length > 0) {
     const boundaries = new Set(req.shallowIn);
     const queue: string[] = [];
     for (const have of req.haves) {
@@ -369,13 +376,16 @@ function planFetch(repo: Repo, req: FetchRequest): FetchPlan {
   // and would count the parents of a shallow boundary as held, which
   // they are not. Held objects are exactly the held commits plus their
   // tree closures (the held set is already cut at the boundaries).
-  for (const oid of held) {
-    heldObjects.add(oid);
-    const info = parseCommit(lookup(oid)?.data ?? Buffer.alloc(0));
-    if (info !== null) addTreeInto(info.tree, heldObjects);
-  }
-  for (const have of req.haves) {
-    if (lookup(have)?.type === 'tag') heldObjects.add(have);
+  // With no haves, held is empty and there is nothing to add.
+  if (req.haves.length > 0) {
+    for (const oid of held) {
+      heldObjects.add(oid);
+      const info = parseCommit(lookup(oid)?.data ?? Buffer.alloc(0));
+      if (info !== null) addTreeInto(info.tree, heldObjects);
+    }
+    for (const have of req.haves) {
+      if (lookup(have)?.type === 'tag') heldObjects.add(have);
+    }
   }
 
   // Objects to send: the included commits' trees plus tag/extra roots,
@@ -427,14 +437,17 @@ function planFetch(repo: Repo, req: FetchRequest): FetchPlan {
   }
 
   // ACK every have that is an ancestor-or-equal of a want.
+  // With no haves there is nothing to ACK.
   const acks: string[] = [];
-  for (const have of req.haves) {
-    const peeled = peelToCommit(repo, have) ?? have;
-    if (lookup(peeled)?.type !== 'commit') continue;
-    for (const want of wantCommits) {
-      if (isAncestor(lookup, peeled, want)) {
-        acks.push(have);
-        break;
+  if (req.haves.length > 0) {
+    for (const have of req.haves) {
+      const peeled = peelToCommit(repo, have) ?? have;
+      if (lookup(peeled)?.type !== 'commit') continue;
+      for (const want of wantCommits) {
+        if (isAncestor(lookup, peeled, want)) {
+          acks.push(have);
+          break;
+        }
       }
     }
   }

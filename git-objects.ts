@@ -114,6 +114,56 @@ export function parseCommit(data: Buffer): CommitInfo | null {
   return { tree, parents, author, committer, message };
 }
 
+/**
+ * Parent OIDs of a commit object, without the full parse: scan the raw
+ * header bytes just far enough to validate the tree line and collect
+ * `parent` lines. Returns null exactly when parseCommit would (no header
+ * terminator, or no tree line).
+ */
+export function parseCommitParents(data: Buffer): string[] | null {
+  const split = data.indexOf('\n\n');
+  if (split === -1) return null;
+
+  const parents: string[] = [];
+  let tree = '';
+  let lineStart = 0;
+
+  while (lineStart <= split) {
+    let lineEnd = data.indexOf(0x0a, lineStart);
+    if (lineEnd === -1 || lineEnd > split) lineEnd = split;
+
+    const len = lineEnd - lineStart;
+
+    if (
+      len >= 5 &&
+      data[lineStart] === 0x74 && // t
+      data[lineStart + 1] === 0x72 && // r
+      data[lineStart + 2] === 0x65 && // e
+      data[lineStart + 3] === 0x65 && // e
+      data[lineStart + 4] === 0x20 // space
+    ) {
+      tree = data.toString('utf8', lineStart + 5, lineEnd).trim();
+    } else if (
+      len >= 7 &&
+      data[lineStart] === 0x70 && // p
+      data[lineStart + 1] === 0x61 && // a
+      data[lineStart + 2] === 0x72 && // r
+      data[lineStart + 3] === 0x65 && // e
+      data[lineStart + 4] === 0x6e && // n
+      data[lineStart + 5] === 0x74 && // t
+      data[lineStart + 6] === 0x20 // space
+    ) {
+      parents.push(data.toString('utf8', lineStart + 7, lineEnd).trim());
+    }
+
+    if (lineEnd === split) break;
+    lineStart = lineEnd + 1;
+  }
+
+  if (tree === '') return null;
+  return parents;
+}
+
 /** "Name <email> epoch +0000" for the fixed epoch. */
 export function identityLine(name: string, email: string): string {
   return `${name} <${email}> ${FIXED_EPOCH_SEC} +0000`;
@@ -278,13 +328,15 @@ export function isAncestor(lookup: ObjectLookup, ancestor: string, tip: string):
   if (ancestor === tip) return true;
   const seen = new Set<string>([tip]);
   const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let queueIndex = 0;
+  while (queueIndex < queue.length) {
+    const oid = queue[queueIndex] as string;
+    queueIndex += 1;
     const obj = lookup(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
-    const info = parseCommit(obj.data);
-    if (info === null) continue;
-    for (const parent of info.parents) {
+    const parents = parseCommitParents(obj.data);
+    if (parents === null) continue;
+    for (const parent of parents) {
       if (parent === ancestor) return true;
       if (!seen.has(parent)) {
         seen.add(parent);

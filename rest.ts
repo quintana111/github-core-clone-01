@@ -9,7 +9,7 @@
 
 import type { HandlerCtx } from './app.ts';
 import { FIXED_ISO, parseCommit } from './git-objects.ts';
-import type { Issue, Label, Pull, Repo } from './store.ts';
+import type { Issue, IssueJsonCache, Label, Pull, Repo } from './store.ts';
 
 export interface RestResult {
   status: number;
@@ -138,8 +138,32 @@ function labelJson(label: Label): JsonObj {
   return { id: 0, name: label.name, color: label.color, description: '', default: false };
 }
 
+function issueJsonCacheIsValid(cache: IssueJsonCache, issue: Issue): boolean {
+  return (
+    cache.title === issue.title &&
+    cache.body === issue.body &&
+    cache.state === issue.state &&
+    cache.commentsLength === issue.comments.length &&
+    cache.labelsRef === issue.labels &&
+    cache.labelsLength === issue.labels.length
+  );
+}
+
 function issueJson(ctx: HandlerCtx, repo: Repo, issue: Issue): JsonObj {
-  return {
+  const origin = ctx.origin;
+
+  let cacheByOrigin = issue._jsonCache;
+  if (cacheByOrigin === undefined) {
+    cacheByOrigin = new Map<string, IssueJsonCache>();
+    issue._jsonCache = cacheByOrigin;
+  }
+
+  const cached = cacheByOrigin.get(origin);
+  if (cached !== undefined && issueJsonCacheIsValid(cached, issue)) {
+    return cached.json;
+  }
+
+  const json: JsonObj = {
     id: repo.id * 100000 + issue.number,
     node_id: Buffer.from(`Issue:${repo.id}:${issue.number}`).toString('base64'),
     number: issue.number,
@@ -156,6 +180,18 @@ function issueJson(ctx: HandlerCtx, repo: Repo, issue: Issue): JsonObj {
     html_url: `${ctx.origin}/${repo.owner}/${repo.name}/issues/${issue.number}`,
     repository_url: `${ctx.origin}/api/v3/repos/${repo.owner}/${repo.name}`,
   };
+
+  cacheByOrigin.set(origin, {
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    commentsLength: issue.comments.length,
+    labelsRef: issue.labels,
+    labelsLength: issue.labels.length,
+    json,
+  });
+
+  return json;
 }
 
 function pullJson(ctx: HandlerCtx, repo: Repo, pull: Pull): JsonObj {
