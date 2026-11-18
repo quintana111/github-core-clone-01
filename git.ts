@@ -281,6 +281,140 @@ function commitParents(repo: Repo, oid: string): string[] {
 }
 
 /**
+ * Fast path for a fresh clone: no haves, depth 1. Returns exactly what
+ * planFetch would for this case (same objects sorted by oid, same shallow
+ * list, empty unshallow/acks). Builder fixes vs the delivered DeepSeek
+ * version: (1) guard parseTag() returning null (a malformed tag must not
+ * throw — the general path skips it); (2) tree entries that are neither
+ * subtrees nor submodules are added whatever their object type is, exactly
+ * like addTreeInto in planFetch (the delivered version only added blobs).
+ */
+function planFetchDepth1NoHaves(repo: Repo, req: FetchRequest): FetchPlan {
+  const objCache = new Map<string, GitObject | undefined>();
+  const getObj = (oid: string): GitObject | undefined => {
+    if (objCache.has(oid)) return objCache.get(oid);
+    const obj = repo.objects.get(oid);
+    objCache.set(oid, obj);
+    return obj;
+  };
+
+  const wantCommits = new Set<string>();
+  const wantTags = new Set<string>();
+  const extraRoots = new Set<string>();
+
+  for (const oid of req.wants) {
+    const obj = getObj(oid);
+    if (!obj) continue;
+
+    if (obj.type === 'commit') {
+      wantCommits.add(oid);
+    } else if (obj.type === 'tag') {
+      if (!wantTags.has(oid)) {
+        wantTags.add(oid);
+        const peeled = peelToCommit(repo, oid);
+        if (peeled !== null) wantCommits.add(peeled);
+      }
+    } else {
+      extraRoots.add(oid);
+    }
+  }
+
+  const send = new Map<string, { type: GitObject['type']; data: Buffer; oid: string }>();
+  const addObject = (oid: string, obj?: GitObject): void => {
+    if (send.has(oid)) return;
+    const o = obj ?? getObj(oid);
+    if (o) send.set(oid, { type: o.type, data: o.data, oid });
+  };
+
+  const processedTrees = new Set<string>();
+  const addTreeClosure = (treeOid: string): void => {
+    if (processedTrees.has(treeOid)) return;
+    processedTrees.add(treeOid);
+
+    const treeObj = getObj(treeOid);
+    if (!treeObj || treeObj.type !== 'tree') return;
+
+    addObject(treeOid, treeObj);
+
+    for (const entry of parseTree(treeObj.data)) {
+      if (entry.mode === '160000') continue;
+      if (entry.mode === '40000') {
+        addTreeClosure(entry.oid);
+      } else {
+        addObject(entry.oid);
+      }
+    }
+  };
+
+  // included commits: wants + peeled commits. Depth 1, no haves => no parent expansion.
+  for (const oid of wantCommits) {
+    const obj = getObj(oid);
+    if (!obj) continue;
+
+    addObject(oid, obj);
+    if (obj.type !== 'commit') continue;
+
+    const parsed = parseCommit(obj.data);
+    if (parsed) addTreeClosure(parsed.tree);
+  }
+
+  // tag roots: include tag object itself and immediate target handling.
+  for (const oid of wantTags) {
+    const tagObj = getObj(oid);
+    if (!tagObj) continue;
+
+    addObject(oid, tagObj);
+    if (tagObj.type !== 'tag') continue;
+
+    const tag = parseTag(tagObj.data);
+    if (tag === null) continue;
+    const targetOid = tag.object;
+    const targetObj = getObj(targetOid);
+    if (!targetObj) continue;
+
+    if (targetObj.type === 'tree') {
+      addTreeClosure(targetOid);
+    } else if (targetObj.type === 'blob' || targetObj.type === 'tag') {
+      addObject(targetOid, targetObj);
+    }
+  }
+
+  // extra roots: blob itself, or tree root plus closure.
+  for (const oid of extraRoots) {
+    const obj = getObj(oid);
+    if (!obj) continue;
+
+    if (obj.type === 'tree') {
+      addTreeClosure(oid);
+    } else {
+      addObject(oid, obj);
+    }
+  }
+
+  const shallowSet = new Set<string>();
+  for (const oid of wantCommits) {
+    const parents = commitParents(repo, oid);
+    if (parents.length === 0) continue;
+
+    for (const parent of parents) {
+      if (!wantCommits.has(parent)) {
+        shallowSet.add(oid);
+        break;
+      }
+    }
+  }
+
+  const objects = Array.from(send.values()).sort((a, b) =>
+    a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0,
+  );
+  const shallow = Array.from(shallowSet).sort((a, b) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+
+  return { objects, shallow, unshallow: [], acks: [] };
+}
+
+/**
  * Decide what a fetch sends. `depth` is an absolute depth from the wants
  * (the suite's deepen N means total depth N, verified against its deepen
  * check: deepen 2 from a depth-1 clone delivers exactly one generation).
@@ -290,6 +424,7 @@ function commitParents(repo: Repo, oid: string): string[] {
  * parent that is neither delivered nor held.
  */
 function planFetch(repo: Repo, req: FetchRequest): FetchPlan {
+  if (req.haves.length === 0 && req.depth === 1) return planFetchDepth1NoHaves(repo, req);
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const wantTags: string[] = [];
   const wantCommits: string[] = [];

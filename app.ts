@@ -15,6 +15,19 @@ import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
+const REQ_PREFIX = 'req-';
+const ZERO_PAD = ['', '0', '00', '000', '0000', '00000', '000000', '0000000', '00000000'] as const;
+const hasOwn = Object.prototype.hasOwnProperty;
+
+const BODY_HEADERS: Record<string, string> = {
+  'content-type': JSON_TYPE,
+  'x-github-request-id': '',
+  'content-length': '',
+};
+const NO_BODY_HEADERS: Record<string, string> = {
+  'content-type': JSON_TYPE,
+  'x-github-request-id': '',
+};
 
 export interface HandlerCtx {
   readonly store: Store;
@@ -43,17 +56,41 @@ export function createStore(): Store {
 let requestSeq = 0;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
-  const requestId = `req-${String(requestSeq).padStart(8, '0')}`;
-  const outHeaders: Record<string, string> = {
-    'content-type': JSON_TYPE,
-    'x-github-request-id': requestId,
-  };
-  if (text !== '') outHeaders['content-length'] = String(Buffer.byteLength(text));
-  for (const key of Object.keys(headers)) {
+  const text = status === 204 ? '' : String(JSON.stringify(body)) + '\n';
+
+  const seqStr = '' + requestSeq;
+  const padLen = 8 - seqStr.length;
+  const requestId = REQ_PREFIX + (padLen > 0 ? ZERO_PAD[padLen] as string : '') + seqStr;
+
+  let outHeaders: Record<string, string> | undefined;
+
+  for (const key in headers) {
+    if (!hasOwn.call(headers, key)) continue;
+
+    if (outHeaders === undefined) {
+      outHeaders = {
+        'content-type': JSON_TYPE,
+        'x-github-request-id': requestId,
+      };
+      if (text !== '') {
+        outHeaders['content-length'] = String(Buffer.byteLength(text));
+      }
+    }
+
     outHeaders[key] = headers[key] as string;
   }
-  res.writeHead(status, outHeaders);
+
+  if (outHeaders !== undefined) {
+    res.writeHead(status, outHeaders);
+  } else if (text === '') {
+    NO_BODY_HEADERS['x-github-request-id'] = requestId;
+    res.writeHead(status, NO_BODY_HEADERS);
+  } else {
+    BODY_HEADERS['x-github-request-id'] = requestId;
+    BODY_HEADERS['content-length'] = String(Buffer.byteLength(text));
+    res.writeHead(status, BODY_HEADERS);
+  }
+
   res.end(text);
 }
 
@@ -61,31 +98,90 @@ function sendResult(res: ServerResponse, result: RestResult): void {
   sendJson(res, result.status, result.body, result.headers ?? {});
 }
 
+const SLASH = 47;
+const QUESTION = 63;
+const PERCENT = 37;
+
+function parseSegmentsUntilQuery(url: string, out: string[]): number {
+  const len = url.length;
+  let i = 0;
+  let q = -1;
+
+  while (i < len) {
+    while (i < len && url.charCodeAt(i) === SLASH) i++;
+    if (i >= len) break;
+
+    if (url.charCodeAt(i) === QUESTION) {
+      q = i;
+      break;
+    }
+
+    let j = i;
+    let hasPercent = false;
+
+    while (j < len) {
+      const c = url.charCodeAt(j);
+      if (c === SLASH || c === QUESTION) break;
+      if (c === PERCENT) hasPercent = true;
+      j++;
+    }
+
+    const raw = url.slice(i, j);
+
+    if (hasPercent) {
+      try {
+        out.push(decodeURIComponent(raw));
+      } catch {
+        out.push(raw);
+      }
+    } else {
+      out.push(raw);
+    }
+
+    if (j >= len) break;
+
+    const c = url.charCodeAt(j);
+    if (c === QUESTION) {
+      q = j;
+      break;
+    }
+
+    i = j + 1;
+  }
+
+  return q;
+}
+
 function pathSegments(req: IncomingMessage): string[] {
   const url = req.url ?? '/';
-  const q = url.indexOf('?');
-  const path = q === -1 ? url : url.slice(0, q);
   const out: string[] = [];
-  for (const s of path.split('/')) {
-    if (s === '') continue;
-    if (s.includes('%')) {
-      try {
-        out.push(decodeURIComponent(s));
-        continue;
-      } catch {
-        // Fall through to the raw segment, as before.
-      }
-    }
-    out.push(s);
-  }
+  parseSegmentsUntilQuery(url, out);
   return out;
 }
 
 function queryOf(req: IncomingMessage): URLSearchParams {
   const url = req.url ?? '/';
   const q = url.indexOf('?');
-  if (q === -1) return new URLSearchParams();
+
+  if (q === -1 || q + 1 === url.length) return new URLSearchParams();
+
   return new URLSearchParams(url.slice(q + 1));
+}
+
+function parseRequest(req: IncomingMessage): {
+  segments: string[];
+  query: URLSearchParams;
+} {
+  const url = req.url ?? '/';
+  const segments: string[] = [];
+  const q = parseSegmentsUntilQuery(url, segments);
+
+  const query =
+    q === -1 || q + 1 === url.length
+      ? new URLSearchParams()
+      : new URLSearchParams(url.slice(q + 1));
+
+  return { segments, query };
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer | { error: 'too-large' }> {
@@ -144,8 +240,7 @@ export function createApp(store: Store = createStore()): Server {
     requestSeq += 1;
     void (async () => {
       const method = req.method ?? 'GET';
-      const segments = pathSegments(req);
-      const query = queryOf(req);
+      const { segments, query } = parseRequest(req);
       const body = await readBody(req);
       if (typeof body === 'object' && 'error' in body) {
         sendJson(res, 413, { message: 'Request body too large' });

@@ -56,7 +56,13 @@ export interface DecodedPacket {
   readonly payload: Buffer | null;
 }
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+const HEX_VAL = new Uint8Array(256);
+HEX_VAL.fill(0xff);
+for (let i = 0; i < 10; i++) HEX_VAL[0x30 + i] = i;
+for (let i = 0; i < 6; i++) {
+  HEX_VAL[0x41 + i] = 10 + i;
+  HEX_VAL[0x61 + i] = 10 + i;
+}
 
 /**
  * Decode pkt-lines from the start of `buf` until a flush packet or the end
@@ -70,9 +76,15 @@ export function decodePktStream(buf: Buffer): { lines: string[]; rest: Buffer } 
   for (;;) {
     if (offset >= buf.length) return { lines, rest: Buffer.alloc(0) };
     if (offset + 4 > buf.length) throw new Error('truncated pkt-line header');
-    const head = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const length = Number.parseInt(head, 16);
+    const h0 = HEX_VAL[buf[offset] as number];
+    const h1 = HEX_VAL[buf[offset + 1] as number];
+    const h2 = HEX_VAL[buf[offset + 2] as number];
+    const h3 = HEX_VAL[buf[offset + 3] as number];
+    if ((h0 as number) > 15 || (h1 as number) > 15 || (h2 as number) > 15 || (h3 as number) > 15) {
+      const head = buf.subarray(offset, offset + 4).toString('ascii');
+      throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
+    }
+    const length = ((h0 as number) << 12) | ((h1 as number) << 8) | ((h2 as number) << 4) | (h3 as number);
     if (length === 0) return { lines, rest: buf.subarray(offset + 4) };
     if (length === 1 || length === 2) {
       offset += 4;
@@ -80,7 +92,7 @@ export function decodePktStream(buf: Buffer): { lines: string[]; rest: Buffer } 
     }
     if (length === 3 || length > PKT_LINE_MAX) throw new Error(`invalid pkt-line length ${length}`);
     if (offset + length > buf.length) throw new Error('truncated pkt-line');
-    lines.push(buf.subarray(offset + 4, offset + length).toString('utf8'));
+    lines.push(buf.toString('utf8', offset + 4, offset + length));
     offset += length;
   }
 }
@@ -234,18 +246,25 @@ function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; 
   return { baseOffset: value, next: offset };
 }
 
-/** Inflate one zlib stream starting at `offset`; returns its bytes and the offset past it. */
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const view = buffer.subarray(offset);
+const INFLATE_INFO = { info: true } as const;
+
+/** Inflate one zlib stream starting at `offset` (bounded at `trailerBound`); returns its bytes and the offset past it. */
+function inflateAt(buffer: Buffer, offset: number, trailerBound: number): { data: Buffer; next: number } {
+  const view = buffer.subarray(offset, trailerBound);
   let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    result = inflateSync(view, INFLATE_INFO) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   } catch (err) {
     throw new Error(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`);
   }
   const written = result.engine.bytesWritten;
   if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
   return { data: result.buffer, next: offset + written };
+}
+
+/** The SHA-1 object id of `type` + `data`, as git computes it (header hashed as a short string, no header Buffer). */
+function hashObjectFast(type: ObjectType, data: Buffer): string {
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'ascii').update(data).digest('hex');
 }
 
 /**
@@ -280,7 +299,7 @@ export function readPack(
     oid?: string;
   }
   const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
+  let hasDelta = false;
   let offset = 12;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
@@ -289,6 +308,7 @@ export function readPack(
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
+      hasDelta = true;
       const base = readOfsDeltaBase(pack, offset);
       offset = base.next;
       if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
@@ -296,24 +316,38 @@ export function readPack(
       }
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (typeCode === 7) {
+      hasDelta = true;
       if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
       entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(pack, offset, trailerStart);
     if (inflated.data.length !== header.size) {
       throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     }
     entry.data = inflated.data;
     offset = inflated.next;
     raw.push(entry);
-    byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
 
   const objects = new Map<string, GitObject>();
+
+  if (!hasDelta) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode] as ObjectType;
+      const data = entry.data;
+      const oid = hashObjectFast(type, data);
+      if (!objects.has(oid)) objects.set(oid, { type, data });
+    }
+    return objects;
+  }
+
+  const byOffset = new Map<number, RawEntry>();
+  for (const entry of raw) byOffset.set(entry.offset, entry);
+
   const resolvedByOid = new Map<string, RawEntry>();
   const resolving = new Set<number>();
   const resolve = (entry: RawEntry): { type: ObjectType; data: Buffer; oid: string } => {
